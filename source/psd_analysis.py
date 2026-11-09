@@ -98,7 +98,7 @@ if __name__ == "__main__":
     
     try:
         # Import the ingestion script
-        from ingestion import extract_data
+        from preprocessing import extract_data
         
         # 1. Ingest
         clean_df, sizes = extract_data(file_path, sheet_name="Pre-milled")
@@ -113,5 +113,5 @@ if __name__ == "__main__":
         print(analysis_df.head(10).to_string(index=False))
         
     except FileNotFoundError:
-        print("Error: Could not find the Excel file or ingestion.py.")
+        print("Error: Could not find the Excel file or preprocessing.py.")
         print("Ensure you are running this from within the PSD-Tool/src/ folder.")
