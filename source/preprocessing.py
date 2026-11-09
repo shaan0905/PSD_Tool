@@ -1,128 +1,112 @@
 import pandas as pd
 import numpy as np
-
-def extract_data(filepath, sheet_name="Pre-milled"):
-    """
-    Extracts data from sample excel sheet, this is just for the pre milled page for now, but I can update this for the post millage data too.
-    """
-    # Read the Excel file 
-    df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=2)
-    
-    # Extract the samples from this specific excel sheet, just the pre milled and currently won't work for additional data sheets,
-    # Will have to make some sort of decision on how imputs will work, excel sheet or csv file, or a straight input of the data. 
-    # My current best idea is to allow the user to input each row of data, and then compile all of these entries before running the calculation.
-    df = df_raw.iloc[:, 0:10].copy()
-    
-    # Standardize sieve column names
-    # Replace 'pan' or 'PAN' with 0
-    df.columns = [0 if str(c).lower() == 'pan' else c for c in df.columns]
-    
-    # Convert mm to um (if a sieve size is less than 50, it is in mm), since variance of units found in the excel sheet. 
-    # This conversion could be useful for the final tool, as it will allow for a more standardized input of data. Maybe unit choice prompts?
-    raw_sizes = df.columns[1:].values
-    sieve_sizes_um = [
-        float(s) * 1000 if isinstance(s, (int, float)) and float(s) < 50 else float(s) 
-        for s in raw_sizes
-    ]
-    df.columns = ['Sample'] + sieve_sizes_um
-    
-    # Clean empty rows
-    df = df.dropna(subset=['Sample']) # Drop rows where Column A is completely empty
-    
-    # Tag Categories
-    # Filter for categories, where the first 9 columns are all NaN, and the first column is not NaN.
-    df['Category'] = np.where(df.iloc[:, 1:10].isna().all(axis=1), df['Sample'], np.nan)
-    
-    # Forward-fill the category down the rows. (Default to 'Pure Samples' for the top section)
-    df['Category'] = df['Category'].ffill().fillna('Pure Samples')
-    
-    # Drop the section header rows themselves now that we have the tags
-    df = df.dropna(subset=sieve_sizes_um, how='all').reset_index(drop=True)
-    
-    # Ensure all mass data is numeric (fill any missing/blank cells with 0)
-    df[sieve_sizes_um] = df[sieve_sizes_um].apply(pd.to_numeric, errors='coerce').fillna(0)
-    
-    # Reorder columns to put Category next to Sample
-    cols = ['Sample', 'Category'] + sieve_sizes_um
-    df = df[cols]
-    
-    return df, sieve_sizes_um
 import os
 
 
-
-def calculate_distributions(
-    clean_df: pd.DataFrame, 
-    sieve_sizes_um: list[float], 
-    upper_bound_um: float = 4750.0,
-    pan_cum_label: float = 10.0
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_data(filepath: str, sheet_name: str = "Pre-milled") -> pd.DataFrame:
     """
-    Takes the cleaned wide-format DataFrame from extract_data() and calculates:
-    1. df_pct: Total mass and Percentage Mass retained per sieve (row-wise).
-    2. df_cum: Cumulative Percentage Passing (Undersize) matching the Excel sheet.
+    Extracts raw sieve mass data from either 'Pre-milled' or 'Milled' sheets.
+    Dynamically tracks section categories and varying sieve aperture stacks.
+    Returns a unified long/tidy DataFrame ready for distribution processing.
     """
-    meta_cols = ['Sample', 'Category']
-    masses = clean_df[sieve_sizes_um].copy()
+    df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
     
-    # 1. Row-wise total mass (g) across all sieves + pan
-    total_mass = masses.sum(axis=1)
-    if (total_mass <= 0).any():
-        raise ValueError("One or more samples have a total mass <= 0. Check input data.")
-        
-    # 2. Percentage mass retained on each sieve (%)
-    pct_mass = masses.div(total_mass, axis=0) * 100.0
-    
-    # Assemble Percentage Mass DataFrame
-    df_pct = pd.concat(
-        [clean_df[meta_cols], total_mass.rename('Total_Mass_g'), pct_mass], 
-        axis=1
-    )
-    
-    # 3. Cumulative Distribution (% Passing / Undersize)
-    # Running sum of % mass retained from coarsest sieve (3350 um) to pan (0 um)
-    cum_retained = pct_mass.cumsum(axis=1)
-    
-    # Subtract cumulative retained from 100% (clipping floating-point drift like -1.26e-14 to 0.0)
-    cum_passing = np.clip(100.0 - cum_retained, 0.0, 100.0)
-    cum_passing.loc[:, 0.0] = cum_passing.loc[:, 0.0].round(10) # Force exact 0.0 on the pan
-    
-    # Assemble Cumulative Distribution DataFrame with the 4750 um (100%) starting column
-    df_cum = clean_df[meta_cols].copy()
-    df_cum[upper_bound_um] = 100.0
-    
-    for size in sieve_sizes_um:
-        # Match Excel's convention where the pan end-point is labelled 10.0 um in the cumulative table
-        col_name = pan_cum_label if size == 0.0 else size
-        df_cum[col_name] = cum_passing[size]
-        
-    return df_pct, df_cum
- 
-if __name__ == "__main__":
-    # Get the directory where ingestion.py is located
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Go up one level to the root, then into the data folder
-    file_path = os.path.join(current_dir, '..', 'data', '220125_Particle_Size_Distributions_EL.xlsx')
-    
-    # Run the extraction
-    clean_df, sizes = extract_data(file_path)
-    print("Successfully Extracted Data:")
-    print(clean_df)
-    print(f"Total rows extracted: {len(clean_df)}")
+    # Locate the header row containing 'Sample' in column A
+    sample_header_idx = None
+    for idx, val in enumerate(df_raw.iloc[:, 0]):
+        if str(val).strip().lower() == 'sample':
+            sample_header_idx = idx
+            break
+            
+    if sample_header_idx is None:
+        raise ValueError(f"Could not locate 'Sample' header in sheet '{sheet_name}'.")
 
-if __name__ == "__main__":
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(current_dir, '..', 'data', '220125_Particle_Size_Distributions_EL.xlsx')
+    # Initial sieve apertures from row 2
+    raw_apertures = df_raw.iloc[sample_header_idx, 1:10].values
+    current_apertures = [
+        0.0 if str(s).strip().lower() == 'pan' 
+        else (float(s) * 1000.0 if float(s) < 50.0 else float(s))
+        for s in raw_apertures
+    ]
+
+    current_category = 'Pure Samples'
+    records = []
+
+    # Iterate over rows below the main header
+    for r in range(sample_header_idx + 1, len(df_raw)):
+        sample_name = df_raw.iloc[r, 0]
+        if pd.isna(sample_name) or str(sample_name).strip() == '':
+            continue
+            
+        row_vals = df_raw.iloc[r, 1:10].values
+        
+        # Check if this row is a Category Header / Sieve Reset (e.g. '10% PKS')
+        is_all_na = pd.isna(row_vals).all()
+        has_pan = any(str(v).strip().lower() == 'pan' for v in row_vals if pd.notna(v))
+        
+        if is_all_na or has_pan:
+            current_category = str(sample_name).strip()
+            # If the header row defines new sieve apertures (like row 15 in Milled)
+            if has_pan:
+                current_apertures = [
+                    0.0 if str(s).strip().lower() == 'pan' 
+                    else (float(s) * 1000.0 if float(s) < 50.0 else float(s))
+                    for s in row_vals
+                ]
+            continue
+            
+        # Parse numeric masses
+        masses = [pd.to_numeric(v, errors='coerce') for v in row_vals]
+        if all(pd.isna(m) for m in masses):
+            continue
+        masses = [0.0 if pd.isna(m) else float(m) for m in masses]
+        
+        # Record sample row with its corresponding sieve stack
+        for aperture, mass in zip(current_apertures, masses):
+            records.append({
+                'Sample': str(sample_name).strip(),
+                'Category': current_category,
+                'Sieve_um': aperture,
+                'Mass_g': mass
+            })
+
+    return pd.DataFrame(records)
+
+
+def calculate_distributions(df_long: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Computes total recovered sample mass, percentage mass retained, and
+    cumulative passing (undersize) for each individual sample, respecting
+    its specific sieve stack apertures.
+    """
+    processed_samples = []
     
-    # 1. Run the raw mass extraction
-    clean_df, sizes = extract_data(file_path, sheet_name="Pre-milled")
-    
-    # 2. Compute Percentage Mass and Cumulative Distributions
-    df_pct, df_cum = calculate_distributions(clean_df, sizes)
-    
-    print("--- Percentage Mass Retained (%) ---")
-    print(df_pct.head().to_string(index=False))
-    
-    print("\n--- Cumulative Distribution (% Passing) ---")
-    print(df_cum.head().to_string(index=False))
+    for (sample, category), group in df_long.groupby(['Sample', 'Category'], sort=False):
+        # Sort sieves from coarsest down to pan (0 um)
+        grp = group.sort_values(by='Sieve_um', ascending=False).copy()
+        
+        total_mass = grp['Mass_g'].sum()
+        if total_mass <= 0:
+            continue
+            
+        grp['Pct_Mass'] = (grp['Mass_g'] / total_mass) * 100.0
+        grp['Cum_Retained'] = grp['Pct_Mass'].cumsum()
+        grp['Cum_Passing'] = np.clip(100.0 - grp['Cum_Retained'], 0.0, 100.0)
+        
+        # Determine appropriate top boundary: 6000 um for 4750 um stacks, 4750 um for 3350 um stacks
+        max_sieve = grp['Sieve_um'].max()
+        top_bound = 6000.0 if max_sieve > 4000.0 else 4750.0
+        
+        sieve_array = np.array([top_bound] + [10.0 if s == 0.0 else s for s in grp['Sieve_um'].values])
+        cum_array = np.array([100.0] + list(grp['Cum_Passing'].values))
+        cum_array[-1] = 0.0  # Force exact 0.0% for the pan / 10 um bound
+        
+        processed_samples.append({
+            'Sample': sample,
+            'Category': category,
+            'Total_Mass_g': total_mass,
+            'Sieves_um': sieve_array,
+            'Cum_Passing': cum_array
+        })
+
+    return df_long, processed_samples
