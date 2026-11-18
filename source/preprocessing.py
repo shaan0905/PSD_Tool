@@ -1,13 +1,39 @@
-import pandas as pd
-import numpy as np
 import os
+import numpy as np
+import pandas as pd
+
+
+def _parse_aperture_um(val) -> float:
+    """Converts raw header values (mm, um, or 'pan') into micrometres (um)."""
+    s_str = str(val).strip().lower()
+    if s_str == 'pan':
+        return 0.0
+    num = float(val)
+    # Values < 50 are in mm (e.g. 3.35 mm -> 3350 um), unless 0
+    return num * 1000.0 if (0.0 < num < 50.0) else num
+
+
+def _find_sieve_end_col(row_values) -> int:
+    """
+    Finds the column index of 'pan' (inclusive) across a header row so the
+    Excel sheet can have any number of sieve columns.
+    """
+    for idx in range(1, len(row_values)):
+        val = row_values[idx]
+        if pd.isna(val):
+            break
+        s_str = str(val).strip().lower()
+        if s_str == 'pan':
+            return idx + 1
+        if s_str == 'total':
+            return idx
+    return 10  # Fallback to standard 9 sieve columns (cols 1..9)
 
 
 def extract_data(filepath: str, sheet_name: str = "Pre-milled") -> pd.DataFrame:
     """
-    Extracts raw sieve mass data from either 'Pre-milled' or 'Milled' sheets.
-    Dynamically tracks section categories and varying sieve aperture stacks.
-    Returns a unified long/tidy DataFrame ready for distribution processing.
+    Extracts raw sieve mass data from Excel sheets with any number of sieve columns.
+    Dynamically tracks section categories and mid-sheet sieve stack changes.
     """
     df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
     
@@ -21,13 +47,10 @@ def extract_data(filepath: str, sheet_name: str = "Pre-milled") -> pd.DataFrame:
     if sample_header_idx is None:
         raise ValueError(f"Could not locate 'Sample' header in sheet '{sheet_name}'.")
 
-    # Initial sieve apertures from row 2
-    raw_apertures = df_raw.iloc[sample_header_idx, 1:10].values
-    current_apertures = [
-        0.0 if str(s).strip().lower() == 'pan' 
-        else (float(s) * 1000.0 if float(s) < 50.0 else float(s))
-        for s in raw_apertures
-    ]
+    header_row = df_raw.iloc[sample_header_idx].values
+    end_col = _find_sieve_end_col(header_row)
+    raw_apertures = header_row[1:end_col]
+    current_apertures = [_parse_aperture_um(s) for s in raw_apertures]
 
     current_category = 'Pure Samples'
     records = []
@@ -38,21 +61,18 @@ def extract_data(filepath: str, sheet_name: str = "Pre-milled") -> pd.DataFrame:
         if pd.isna(sample_name) or str(sample_name).strip() == '':
             continue
             
-        row_vals = df_raw.iloc[r, 1:10].values
+        full_row = df_raw.iloc[r].values
+        row_vals = full_row[1:end_col]
         
-        # Check if this row is a Category Header / Sieve Reset (e.g. '10% PKS')
+        # Check if this row is a Category Header or a Mid-Sheet Sieve Header Reset
         is_all_na = pd.isna(row_vals).all()
-        has_pan = any(str(v).strip().lower() == 'pan' for v in row_vals if pd.notna(v))
+        has_pan = any(str(v).strip().lower() == 'pan' for v in full_row[1:20] if pd.notna(v))
         
         if is_all_na or has_pan:
             current_category = str(sample_name).strip()
-            # If the header row defines new sieve apertures (like row 15 in Milled)
             if has_pan:
-                current_apertures = [
-                    0.0 if str(s).strip().lower() == 'pan' 
-                    else (float(s) * 1000.0 if float(s) < 50.0 else float(s))
-                    for s in row_vals
-                ]
+                end_col = _find_sieve_end_col(full_row)
+                current_apertures = [_parse_aperture_um(s) for s in full_row[1:end_col]]
             continue
             
         # Parse numeric masses
@@ -61,7 +81,6 @@ def extract_data(filepath: str, sheet_name: str = "Pre-milled") -> pd.DataFrame:
             continue
         masses = [0.0 if pd.isna(m) else float(m) for m in masses]
         
-        # Record sample row with its corresponding sieve stack
         for aperture, mass in zip(current_apertures, masses):
             records.append({
                 'Sample': str(sample_name).strip(),
@@ -76,8 +95,7 @@ def extract_data(filepath: str, sheet_name: str = "Pre-milled") -> pd.DataFrame:
 def calculate_distributions(df_long: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     """
     Computes total recovered sample mass, percentage mass retained, and
-    cumulative passing (undersize) for each individual sample, respecting
-    its specific sieve stack apertures.
+    cumulative passing (undersize) for each sample across any custom sieve stack.
     """
     processed_samples = []
     
@@ -93,13 +111,18 @@ def calculate_distributions(df_long: pd.DataFrame) -> tuple[pd.DataFrame, list[d
         grp['Cum_Retained'] = grp['Pct_Mass'].cumsum()
         grp['Cum_Passing'] = np.clip(100.0 - grp['Cum_Retained'], 0.0, 100.0)
         
-        # Determine appropriate top boundary: 6000 um for 4750 um stacks, 4750 um for 3350 um stacks
+        # Determine 100% passing upper boundary (preserve 4750/6000 for standard stacks, or scale by 1.4x for custom stacks)
         max_sieve = grp['Sieve_um'].max()
-        top_bound = 6000.0 if max_sieve > 4000.0 else 4750.0
-        
+        if np.isclose(max_sieve, 3350.0):
+            top_bound = 4750.0
+        elif np.isclose(max_sieve, 4750.0):
+            top_bound = 6000.0
+        else:
+            top_bound = round(max_sieve * 1.4, 1)
+            
         sieve_array = np.array([top_bound] + [10.0 if s == 0.0 else s for s in grp['Sieve_um'].values])
         cum_array = np.array([100.0] + list(grp['Cum_Passing'].values))
-        cum_array[-1] = 0.0  # Force exact 0.0% for the pan / 10 um bound
+        cum_array[-1] = 0.0  # Force exact 0.0% on the pan
         
         processed_samples.append({
             'Sample': sample,
