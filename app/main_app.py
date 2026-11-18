@@ -7,6 +7,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+# python -m streamlit run app/main_app.py
 # Allow importing backend modules from the ../source directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 source_dir = os.path.join(current_dir, '..', 'source')
